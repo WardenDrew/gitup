@@ -1,0 +1,122 @@
+#!/bin/bash
+readonly VERSION='1.0.0'
+set -euo pipefail
+
+if [[ $# -eq 0 || -z ${*//[[:space:]]/} ]]; then
+    echo "gitup $VERSION"
+    echo 'Copyright 2026 Andrew Haskell - https://github.com/wardendrew/gitup'
+    cat <<'HELP'
+
+Usage: gitup commit message here
+Stages changes with git add ., creates a signed commit, and pushes.
+
+Optional .gitup JSON file at the repository root (requires jq):
+{
+  "workflows": ["build.yml", "deploy.yml"],
+  "postWorkflow": [
+    ["ssh", "deploy@example.com", "/srv/my-app/update.sh"],
+    ["echo", "Update complete"]
+  ]
+}
+
+workflows: push workflows to watch for this commit (requires gh).
+No .gitup or an empty workflows list means no waiting or post commands.
+postWorkflow: optional commands, each an array of program and arguments.
+Commands run at the repository root, in order, after all workflows succeed.
+A failed workflow or command stops execution. Commands use no shell evaluation.
+HELP
+    exit 0
+fi
+
+if [[ $(git rev-parse --is-inside-work-tree 2>/dev/null) != true ]]; then
+    echo 'gitup: run this inside a Git working tree.' >&2
+    exit 1
+fi
+branch=$(git symbolic-ref --quiet --short HEAD) || {
+    echo 'gitup: cannot push from a detached HEAD.' >&2
+    exit 1
+}
+repo_root=$(git rev-parse --show-toplevel)
+
+# .gitup is JSON configuration; see gitup.example.
+workflows=()
+post_workflow=()
+if [[ -f $repo_root/.gitup ]]; then
+    command -v jq >/dev/null || {
+        echo 'gitup: install jq to read .gitup configuration.' >&2
+        exit 1
+    }
+    config=$(jq -cse '
+        def command_array:
+            type == "array" and all(.[];
+                type == "string" and (contains("\u0000") | not));
+        if length == 1 and (.[0] |
+            type == "object" and
+            ((keys - ["workflows", "postWorkflow"]) | length == 0) and
+            ((.workflows // []) | command_array and all(.[]; length > 0)) and
+            ((.postWorkflow // []) | type == "array" and all(.[];
+                command_array and length > 0 and (.[0] | length > 0))))
+        then .[0]
+        else error(".gitup requires workflows as strings and postWorkflow as arrays of command arguments")
+        end
+    ' "$repo_root/.gitup")
+    mapfile -d '' -t workflows < <(jq -j '(.workflows // [])[] | ., "\u0000"' <<< "$config")
+    mapfile -t post_workflow < <(jq -c '(.postWorkflow // [])[]' <<< "$config")
+fi
+if [[ ${#workflows[@]} -gt 0 ]] && ! command -v gh >/dev/null; then
+    echo 'gitup: install gh to watch the configured workflows.' >&2
+    exit 1
+fi
+
+git add .
+# Require signing; never retry unsigned if the keychain is locked.
+git commit -S -m "$*"
+sha=$(git rev-parse HEAD)
+push_output=$(git push --porcelain)
+printf '%s\n' "$push_output"
+[[ ${#workflows[@]} -gt 0 ]] || exit 0
+
+# Watch the actual push destination, including pushRemote and push refspecs.
+push_url=
+push_branch=
+while IFS= read -r line; do
+    if [[ $line == 'To '* ]]; then
+        push_url=${line#To }
+    elif [[ $line == *$'\t'"refs/heads/$branch:refs/heads/"* ]]; then
+        refspec=${line#*$'\t'}
+        refspec=${refspec%%$'\t'*}
+        push_branch=${refspec#*:refs/heads/}
+    fi
+done <<< "$push_output"
+[[ -n $push_branch ]] || exit 0
+if [[ $push_url =~ ^git@([^:]+):(.+)$ ]]; then
+    push_url="https://${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+elif [[ $push_url =~ ^ssh://git@([^/]+)/(.+)$ ]]; then
+    push_url="https://${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+fi
+export GH_REPO=${push_url%.git}
+cd "$repo_root"
+
+for workflow in "${workflows[@]}"; do
+    run_id=
+    for ((attempt = 0; attempt <= 12; attempt++)); do
+        run_id=$(gh run list --commit "$sha" --branch "$push_branch" --event push \
+            --workflow "$workflow" --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+        [[ -z $run_id ]] || break
+        if ((attempt == 12)); then
+            echo "gitup: no push run appeared for $workflow within 60 seconds." >&2
+            exit 1
+        fi
+        echo "gitup: waiting 5 seconds for $workflow on $push_branch (${sha:0:8})..."
+        sleep 5
+    done
+    gh run watch "$run_id" --exit-status
+done
+
+if [[ ${#post_workflow[@]} -gt 0 ]]; then
+    echo 'gitup: workflows succeeded; running postWorkflow...'
+    for command_json in "${post_workflow[@]}"; do
+        mapfile -d '' -t command_args < <(jq -j '.[] | ., "\u0000"' <<< "$command_json")
+        "${command_args[@]}"
+    done
+fi
