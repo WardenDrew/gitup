@@ -1,5 +1,5 @@
 #!/bin/bash
-readonly VERSION='1.0.0'
+readonly VERSION='1.1.0'
 set -euo pipefail
 
 if [[ $# -eq 0 || -z ${*//[[:space:]]/} ]]; then
@@ -10,7 +10,7 @@ if [[ $# -eq 0 || -z ${*//[[:space:]]/} ]]; then
 Usage: gitup commit message here
 Stages changes with git add ., creates a signed commit, and pushes.
 
-Optional .gitup JSON file at the repository root (requires jq):
+Optional .gitup JSONC file at the repository root (requires jq):
 {
   "workflows": ["build.yml", "deploy.yml"],
   "postWorkflow": [
@@ -19,6 +19,7 @@ Optional .gitup JSON file at the repository root (requires jq):
   ]
 }
 
+Line comments (//), block comments (/* ... */), and trailing commas are supported.
 workflows: push workflows to watch for this commit (requires gh).
 No .gitup or an empty workflows list means no waiting or post commands.
 postWorkflow: optional commands, each an array of program and arguments.
@@ -38,7 +39,7 @@ branch=$(git symbolic-ref --quiet --short HEAD) || {
 }
 repo_root=$(git rev-parse --show-toplevel)
 
-# .gitup is JSON configuration; see gitup.example.
+# Normalize JSONC before validating the configuration.
 workflows=()
 post_workflow=()
 if [[ -f $repo_root/.gitup ]]; then
@@ -46,17 +47,31 @@ if [[ -f $repo_root/.gitup ]]; then
         echo 'gitup: install jq to read .gitup configuration.' >&2
         exit 1
     }
-    config=$(jq -cse '
+    config=$(jq -Rce -s '
+        def jsonc:
+            # Keep strings intact, including escaped quotes and comment markers.
+            [match("\"(?:[^\"\\\\]|\\\\.)*\"|//[^\r\n]*|/\\*(?:[^*]|\\*(?!/))*\\*/|[^\\s\\[\\]{}:,\"/]+|[^\\s]"; "g")
+                | .string
+                | select(startswith("//") or startswith("/*") | not)] as $tokens
+            | [range(0; $tokens | length) as $i
+                | select(($tokens[$i] == "," and
+                    ($tokens[$i + 1] == "}" or $tokens[$i + 1] == "]") and
+                    $i > 0 and
+                    (["[", "{", ":", ","] | index($tokens[$i - 1]) | not)) | not)
+                | $tokens[$i]]
+            | join(" ")
+            | fromjson;
         def command_array:
             type == "array" and all(.[];
                 type == "string" and (contains("\u0000") | not));
-        if length == 1 and (.[0] |
+        jsonc |
+        if (
             type == "object" and
             ((keys - ["workflows", "postWorkflow"]) | length == 0) and
             ((.workflows // []) | command_array and all(.[]; length > 0)) and
             ((.postWorkflow // []) | type == "array" and all(.[];
                 command_array and length > 0 and (.[0] | length > 0))))
-        then .[0]
+        then .
         else error(".gitup requires workflows as strings and postWorkflow as arrays of command arguments")
         end
     ' "$repo_root/.gitup")
